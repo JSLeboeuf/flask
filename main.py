@@ -5,6 +5,7 @@ import os
 import pytz
 from twilio.rest import Client
 import json
+import uuid
 
 app = Flask(__name__)
 
@@ -31,13 +32,11 @@ def get_access_token():
     """Obtient un access token valide en utilisant le refresh token"""
     global ACCESS_TOKEN
     
-    # Si on a un token dans les variables d'environnement
     env_token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     if env_token and env_token != "PASTE_YOUR_ACCESS_TOKEN_HERE":
         ACCESS_TOKEN = env_token
         return ACCESS_TOKEN
     
-    # Sinon, utiliser le refresh token
     if not all([GOOGLE_REFRESH_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET]):
         print("❌ Variables OAuth manquantes pour le refresh token")
         return None
@@ -67,18 +66,41 @@ ACCESS_TOKEN = get_access_token()
 def health():
     return jsonify({"status": "ok", "service": "Autoscale Calendar MCP"})
 
-@app.route("/mcp", methods=["GET"])
-def mcp_tools():
-    """Route pour la découverte des outils - Format JSON simple"""
-    return jsonify({
-        "name": "Autoscale Calendar MCP",
-        "version": "1.0.0",
-        "protocol_version": "0.1.0",
-        "capabilities": {
-            "tools": True
-        },
-        "tools": [
-            {
+# Format MCP Standard Protocol
+@app.route("/mcp", methods=["POST", "GET"])
+def mcp_handler():
+    """Handler principal MCP compatible avec le standard protocol"""
+    
+    # Pour GET, retourner les capacités
+    if request.method == "GET":
+        return jsonify({
+            "mcp_version": "1.0",
+            "protocol_version": "1.0.0",
+            "capabilities": {
+                "tools": True,
+                "prompts": False,
+                "resources": False
+            }
+        })
+    
+    # Pour POST, traiter les requêtes
+    try:
+        # Accepter tous les content-types
+        if request.content_type and 'json' in request.content_type:
+            data = request.json
+        else:
+            data = request.get_json(force=True)
+    except:
+        data = {}
+    
+    print(f"[MCP] Requête reçue: {json.dumps(data)}")
+    
+    method = data.get("method", "")
+    
+    # Initialize/List tools
+    if method == "initialize" or method == "tools/list":
+        return jsonify({
+            "tools": [{
                 "name": "book_appointment",
                 "description": "Réserver un rendez-vous dans Google Calendar avec envoi SMS",
                 "inputSchema": {
@@ -90,75 +112,63 @@ def mcp_tools():
                         },
                         "phone": {
                             "type": "string",
-                            "description": "Numéro de téléphone du client (ex: 514-123-4567)"
-                        },
-                        "email": {
-                            "type": "string",
-                            "description": "Email du client (optionnel)"
+                            "description": "Numéro de téléphone (ex: 514-123-4567)"
                         },
                         "start": {
                             "type": "string",
-                            "description": "Date et heure du rendez-vous au format ISO (ex: 2025-06-27T14:00:00)"
+                            "description": "Date et heure (ex: 2025-06-27T14:00:00)"
                         }
                     },
                     "required": ["name", "phone", "start"]
                 }
-            }
-        ]
-    })
-
-@app.route("/mcp/tools/<tool_name>", methods=["POST"])
-def execute_tool(tool_name):
-    """Exécution d'un outil spécifique"""
-    if tool_name != "book_appointment":
-        return jsonify({"error": f"Tool '{tool_name}' not found"}), 404
+            }]
+        })
     
-    return book_appointment()
-
-@app.route("/mcp", methods=["POST"])
-def mcp_execute():
-    """Route POST principale pour l'exécution"""
-    data = request.json
+    # Call tool
+    elif method == "tools/call":
+        tool_name = data.get("params", {}).get("name")
+        arguments = data.get("params", {}).get("arguments", {})
+        
+        if tool_name == "book_appointment":
+            result = book_appointment_logic(arguments)
+            return jsonify({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": result.get("message", "Erreur lors de la réservation")
+                    }
+                ],
+                "isError": not result.get("success", False)
+            })
+        else:
+            return jsonify({
+                "error": {
+                    "code": -32601,
+                    "message": f"Unknown tool: {tool_name}"
+                }
+            }), 400
     
-    # Gérer différents formats de requête
-    if data.get("method") == "tools/call":
-        # Format MCP standard
-        tool_name = data.get("params", {}).get("name", "book_appointment")
-        params = data.get("params", {}).get("arguments", {})
-    elif "tool" in data:
-        # Format avec tool spécifié
-        tool_name = data.get("tool")
-        params = data.get("arguments", data.get("params", {}))
+    # Fallback - essayer d'exécuter directement
     else:
-        # Format direct
-        tool_name = "book_appointment"
-        params = data
-    
-    if tool_name == "book_appointment":
-        return book_appointment(params)
-    else:
-        return jsonify({"error": f"Unknown tool: {tool_name}"}), 400
+        result = book_appointment_logic(data)
+        return jsonify(result)
 
-def book_appointment(params=None):
-    """Fonction principale de réservation"""
+def book_appointment_logic(params):
+    """Logique de réservation extraite"""
     global ACCESS_TOKEN
     
-    if params is None:
-        params = request.json or {}
-    
-    print(f"[BOOKING] Paramètres reçus: {json.dumps(params)}")
+    print(f"[BOOKING] Paramètres: {json.dumps(params)}")
     
     name = params.get("name", "Client")
     client_phone = params.get("phone")
-    client_email = params.get("email")
     start_str = params.get("start")
 
     # Validations
     if not start_str:
-        return jsonify({"error": "Date et heure requises", "success": False}), 400
+        return {"success": False, "message": "Date et heure requises"}
     
     if not client_phone:
-        return jsonify({"error": "Numéro de téléphone requis", "success": False}), 400
+        return {"success": False, "message": "Numéro de téléphone requis"}
     
     # Formater le numéro de téléphone
     client_phone = client_phone.replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
@@ -171,7 +181,6 @@ def book_appointment(params=None):
     # Parser la date
     try:
         if 'T' in start_str:
-            # Format ISO complet
             if start_str.endswith('Z'):
                 start_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
                 start_time = start_time.astimezone(pytz.timezone(TIMEZONE))
@@ -180,48 +189,34 @@ def book_appointment(params=None):
                 if start_time.tzinfo is None:
                     start_time = pytz.timezone(TIMEZONE).localize(start_time)
         else:
-            # Format simple
             start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
             start_time = pytz.timezone(TIMEZONE).localize(start_time)
     except:
-        return jsonify({
-            "error": "Format de date invalide. Utilisez: 2025-06-27T14:00:00",
-            "success": False
-        }), 400
+        return {"success": False, "message": "Format de date invalide. Utilisez: 2025-06-27T14:00:00"}
     
-    # Vérifier le délai minimum
+    # Vérifications
     now = datetime.now(pytz.timezone(TIMEZONE))
     if start_time < now + timedelta(hours=3):
-        return jsonify({
-            "error": "Les réservations doivent être faites au moins 3 heures à l'avance",
-            "success": False
-        }), 400
+        return {"success": False, "message": "Les réservations doivent être faites au moins 3 heures à l'avance"}
 
-    # Vérifier les heures d'ouverture (9h à 21h)
     if start_time.hour < 9 or start_time.hour >= 21:
-        return jsonify({
-            "error": "Les rendez-vous sont disponibles de 9h à 21h seulement",
-            "success": False
-        }), 400
+        return {"success": False, "message": "Les rendez-vous sont disponibles de 9h à 21h seulement"}
 
     end_time = start_time + timedelta(minutes=30)
 
-    # Vérifier et rafraîchir le token si nécessaire
+    # Token check
     if not ACCESS_TOKEN:
         ACCESS_TOKEN = get_access_token()
         if not ACCESS_TOKEN:
-            return jsonify({
-                "error": "Configuration OAuth manquante",
-                "success": False
-            }), 500
+            return {"success": False, "message": "Configuration OAuth manquante"}
 
-    # Headers pour Google API
+    # Google Calendar API
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    # Vérifier la disponibilité
+    # Vérifier disponibilité
     freebusy_url = "https://www.googleapis.com/calendar/v3/freeBusy"
     busy_check = requests.post(freebusy_url, headers=headers, json={
         "timeMin": start_time.isoformat(),
@@ -230,9 +225,7 @@ def book_appointment(params=None):
         "items": [{"id": CALENDAR_ID}]
     })
 
-    # Si token expiré, rafraîchir et réessayer
     if busy_check.status_code == 401:
-        print("🔄 Token expiré, rafraîchissement...")
         ACCESS_TOKEN = get_access_token()
         if ACCESS_TOKEN:
             headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
@@ -245,92 +238,54 @@ def book_appointment(params=None):
 
     if busy_check.status_code != 200:
         print(f"Erreur freeBusy: {busy_check.text}")
-        return jsonify({
-            "error": "Erreur lors de la vérification des disponibilités",
-            "success": False,
-            "details": busy_check.text
-        }), 500
+        return {"success": False, "message": "Erreur lors de la vérification des disponibilités"}
 
     busy_slots = busy_check.json().get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
     if busy_slots:
-        return jsonify({
-            "error": "Ce créneau est déjà réservé. Veuillez choisir un autre moment.",
-            "success": False
-        }), 409
+        return {"success": False, "message": "Ce créneau est déjà réservé"}
 
     # Créer l'événement
     event_url = f"https://www.googleapis.com/calendar/v3/calendars/{CALENDAR_ID}/events?conferenceDataVersion=1"
     event_payload = {
         "summary": f"Consultation avec {name}",
-        "description": (
-            f"Client: {name}\n"
-            f"Téléphone: {client_phone}\n"
-            f"Email: {client_email or 'Non fourni'}\n\n"
-            f"Rendez-vous confirmé automatiquement via l'agent ElevenLabs."
-        ),
-        "start": {
-            "dateTime": start_time.isoformat(),
-            "timeZone": TIMEZONE
-        },
-        "end": {
-            "dateTime": end_time.isoformat(),
-            "timeZone": TIMEZONE
-        },
-        "attendees": [
-            {"email": EMAIL_RECIPIENT}
-        ],
+        "description": f"Client: {name}\nTéléphone: {client_phone}\n\nRéservé via agent ElevenLabs",
+        "start": {"dateTime": start_time.isoformat(), "timeZone": TIMEZONE},
+        "end": {"dateTime": end_time.isoformat(), "timeZone": TIMEZONE},
+        "attendees": [{"email": EMAIL_RECIPIENT}],
         "conferenceData": {
             "createRequest": {
-                "requestId": f"autoscale-{int(datetime.now().timestamp())}",
+                "requestId": f"autoscale-{uuid.uuid4().hex[:8]}",
                 "conferenceSolutionKey": {"type": "hangoutsMeet"}
             }
-        },
-        "reminders": {
-            "useDefault": False,
-            "overrides": [
-                {"method": "email", "minutes": 60},
-                {"method": "popup", "minutes": 30}
-            ]
         }
     }
-
-    if client_email:
-        event_payload["attendees"].append({"email": client_email})
 
     created_event = requests.post(event_url, headers=headers, json=event_payload)
     
     if created_event.status_code != 200:
-        print(f"Erreur création événement: {created_event.text}")
-        return jsonify({
-            "error": "Erreur lors de la création du rendez-vous",
-            "success": False,
-            "details": created_event.text
-        }), 500
+        print(f"Erreur création: {created_event.text}")
+        return {"success": False, "message": "Erreur lors de la création du rendez-vous"}
 
     event_data = created_event.json()
     meet_link = "Non disponible"
     
-    # Extraire le lien Meet
     if "conferenceData" in event_data and "entryPoints" in event_data["conferenceData"]:
         for entry in event_data["conferenceData"]["entryPoints"]:
             if entry.get("entryPointType") == "video":
                 meet_link = entry.get("uri", "Non disponible")
                 break
 
-    # Envoyer le SMS
-    sms_sent = False
+    # SMS
     if TWILIO_SID and TWILIO_TOKEN:
         try:
             twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
             
-            # SMS au client
             sms_body = (
                 f"Bonjour {name},\n\n"
-                f"Votre rendez-vous avec Autoscale AI est confirmé!\n\n"
+                f"Rendez-vous confirmé!\n\n"
                 f"📅 {start_time.strftime('%d/%m/%Y')}\n"
                 f"🕒 {start_time.strftime('%H:%M')}\n"
-                f"📍 Vidéoconférence\n\n"
-                f"Lien Google Meet:\n{meet_link}\n\n"
+                f"📍 Google Meet:\n{meet_link}\n\n"
                 f"À bientôt!"
             )
             
@@ -340,53 +295,24 @@ def book_appointment(params=None):
                 to=client_phone
             )
             
-            # SMS de notification pour toi
             if SMS_RECIPIENT:
                 twilio_client.messages.create(
                     body=f"Nouveau RDV: {name} ({client_phone}) - {start_time.strftime('%d/%m à %H:%M')}",
                     from_=TWILIO_FROM,
                     to=SMS_RECIPIENT
                 )
-            
-            sms_sent = True
         except Exception as e:
-            print(f"Erreur Twilio: {e}")
-            sms_sent = False
+            print(f"Erreur SMS: {e}")
 
-    # Réponse de succès
-    response = {
+    return {
         "success": True,
-        "message": f"Rendez-vous confirmé pour {name} le {start_time.strftime('%d/%m/%Y à %H:%M')}",
-        "result": {
-            "client_name": name,
-            "client_phone": client_phone,
-            "start": start_time.isoformat(),
-            "end": end_time.isoformat(),
-            "meet_link": meet_link,
-            "sms_sent": sms_sent,
-            "calendar_event_id": event_data.get("id")
-        }
+        "message": f"✅ Rendez-vous confirmé pour {name} le {start_time.strftime('%d/%m/%Y à %H:%M')}. Un SMS de confirmation a été envoyé au {client_phone}."
     }
 
-    return jsonify(response), 200
-
-# Routes additionnelles pour différents formats
-@app.route("/mcp/list-tools", methods=["GET"])
-def list_tools():
-    """Liste des outils disponibles"""
-    return jsonify({
-        "tools": ["book_appointment"]
-    })
-
 if __name__ == "__main__":
-    # Vérification au démarrage
-    print("🚀 Démarrage du serveur MCP Autoscale Calendar")
+    print("🚀 Serveur MCP Autoscale Calendar")
     print(f"📅 Calendrier: {CALENDAR_ID}")
-    print(f"📱 SMS depuis: {TWILIO_FROM}")
-    
-    if ACCESS_TOKEN:
-        print("✅ Access token configuré")
-    else:
-        print("⚠️  Access token non disponible - vérifiez les variables OAuth")
+    print(f"📱 SMS: {TWILIO_FROM}")
+    print(f"✅ Token: {'OK' if ACCESS_TOKEN else 'MANQUANT'}")
     
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
