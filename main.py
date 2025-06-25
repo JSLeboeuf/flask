@@ -11,7 +11,6 @@ app = Flask(__name__)
 # Configuration
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 CALENDAR_ID = os.environ.get("CALENDAR_ID")
-ACCESS_TOKEN = os.environ.get("GOOGLE_ACCESS_TOKEN")
 TIMEZONE = "America/Toronto"
 
 TWILIO_SID = os.environ.get("TWILIO_SID")
@@ -19,6 +18,50 @@ TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_FROM")
 SMS_RECIPIENT = os.environ.get("SMS_RECIPIENT")
 EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT")
+
+# OAuth tokens
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
+
+# Variable globale pour l'access token
+ACCESS_TOKEN = None
+
+def get_access_token():
+    """Obtient un access token valide en utilisant le refresh token"""
+    global ACCESS_TOKEN
+    
+    # Si on a un token dans les variables d'environnement
+    env_token = os.environ.get("GOOGLE_ACCESS_TOKEN")
+    if env_token and env_token != "PASTE_YOUR_ACCESS_TOKEN_HERE":
+        ACCESS_TOKEN = env_token
+        return ACCESS_TOKEN
+    
+    # Sinon, utiliser le refresh token
+    if not all([GOOGLE_REFRESH_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET]):
+        print("❌ Variables OAuth manquantes pour le refresh token")
+        return None
+    
+    print("🔄 Rafraîchissement du access token...")
+    
+    response = requests.post("https://oauth2.googleapis.com/token", data={
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "grant_type": "refresh_token"
+    })
+    
+    if response.status_code == 200:
+        token_data = response.json()
+        ACCESS_TOKEN = token_data.get("access_token")
+        print("✅ Access token rafraîchi avec succès")
+        return ACCESS_TOKEN
+    else:
+        print(f"❌ Erreur lors du refresh: {response.text}")
+        return None
+
+# Initialiser l'access token au démarrage
+ACCESS_TOKEN = get_access_token()
 
 @app.route("/", methods=["GET"])
 def health():
@@ -70,7 +113,6 @@ def execute_tool(tool_name):
     if tool_name != "book_appointment":
         return jsonify({"error": f"Tool '{tool_name}' not found"}), 404
     
-    # Appeler la fonction principale
     return book_appointment()
 
 @app.route("/mcp", methods=["POST"])
@@ -99,6 +141,8 @@ def mcp_execute():
 
 def book_appointment(params=None):
     """Fonction principale de réservation"""
+    global ACCESS_TOKEN
+    
     if params is None:
         params = request.json or {}
     
@@ -162,12 +206,14 @@ def book_appointment(params=None):
 
     end_time = start_time + timedelta(minutes=30)
 
-    # Vérifier que nous avons un access token
-    if not ACCESS_TOKEN or ACCESS_TOKEN == "PASTE_YOUR_ACCESS_TOKEN_HERE":
-        return jsonify({
-            "error": "Configuration manquante: GOOGLE_ACCESS_TOKEN",
-            "success": False
-        }), 500
+    # Vérifier et rafraîchir le token si nécessaire
+    if not ACCESS_TOKEN:
+        ACCESS_TOKEN = get_access_token()
+        if not ACCESS_TOKEN:
+            return jsonify({
+                "error": "Configuration OAuth manquante",
+                "success": False
+            }), 500
 
     # Headers pour Google API
     headers = {
@@ -183,6 +229,19 @@ def book_appointment(params=None):
         "timeZone": TIMEZONE,
         "items": [{"id": CALENDAR_ID}]
     })
+
+    # Si token expiré, rafraîchir et réessayer
+    if busy_check.status_code == 401:
+        print("🔄 Token expiré, rafraîchissement...")
+        ACCESS_TOKEN = get_access_token()
+        if ACCESS_TOKEN:
+            headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
+            busy_check = requests.post(freebusy_url, headers=headers, json={
+                "timeMin": start_time.isoformat(),
+                "timeMax": end_time.isoformat(),
+                "timeZone": TIMEZONE,
+                "items": [{"id": CALENDAR_ID}]
+            })
 
     if busy_check.status_code != 200:
         print(f"Erreur freeBusy: {busy_check.text}")
@@ -282,11 +341,12 @@ def book_appointment(params=None):
             )
             
             # SMS de notification pour toi
-            twilio_client.messages.create(
-                body=f"Nouveau RDV: {name} ({client_phone}) - {start_time.strftime('%d/%m à %H:%M')}",
-                from_=TWILIO_FROM,
-                to=SMS_RECIPIENT
-            )
+            if SMS_RECIPIENT:
+                twilio_client.messages.create(
+                    body=f"Nouveau RDV: {name} ({client_phone}) - {start_time.strftime('%d/%m à %H:%M')}",
+                    from_=TWILIO_FROM,
+                    to=SMS_RECIPIENT
+                )
             
             sms_sent = True
         except Exception as e:
@@ -320,12 +380,13 @@ def list_tools():
 
 if __name__ == "__main__":
     # Vérification au démarrage
-    if not ACCESS_TOKEN or ACCESS_TOKEN == "PASTE_YOUR_ACCESS_TOKEN_HERE":
-        print("⚠️  ERREUR: GOOGLE_ACCESS_TOKEN non configuré!")
-        print("Configurez le token dans les variables Railway")
-    else:
-        print("✅ Serveur MCP Autoscale Calendar démarré")
-        print(f"📅 Calendrier: {CALENDAR_ID}")
-        print(f"📱 SMS depuis: {TWILIO_FROM}")
+    print("🚀 Démarrage du serveur MCP Autoscale Calendar")
+    print(f"📅 Calendrier: {CALENDAR_ID}")
+    print(f"📱 SMS depuis: {TWILIO_FROM}")
     
-    app.run(host="0.0.0.0", port=8080)
+    if ACCESS_TOKEN:
+        print("✅ Access token configuré")
+    else:
+        print("⚠️  Access token non disponible - vérifiez les variables OAuth")
+    
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
