@@ -25,20 +25,20 @@ def health():
     return jsonify({"status": "ok", "service": "Autoscale Calendar MCP"})
 
 @app.route("/mcp", methods=["GET"])
-def mcp_sse():
-    """Route SSE pour ElevenLabs MCP"""
-    def generate():
-        # Format exact attendu par ElevenLabs
-        yield "event: ready\n"
-        yield f"data: {json.dumps({'ready': True})}\n\n"
-        
-        # Envoyer la liste des outils disponibles
-        tools_event = {
-            "type": "tools",
-            "tools": [{
+def mcp_tools():
+    """Route pour la découverte des outils - Format JSON simple"""
+    return jsonify({
+        "name": "Autoscale Calendar MCP",
+        "version": "1.0.0",
+        "protocol_version": "0.1.0",
+        "capabilities": {
+            "tools": True
+        },
+        "tools": [
+            {
                 "name": "book_appointment",
                 "description": "Réserver un rendez-vous dans Google Calendar avec envoi SMS",
-                "input_schema": {
+                "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {
@@ -60,33 +60,49 @@ def mcp_sse():
                     },
                     "required": ["name", "phone", "start"]
                 }
-            }]
-        }
-        yield f"data: {json.dumps(tools_event)}\n\n"
+            }
+        ]
+    })
+
+@app.route("/mcp/tools/<tool_name>", methods=["POST"])
+def execute_tool(tool_name):
+    """Exécution d'un outil spécifique"""
+    if tool_name != "book_appointment":
+        return jsonify({"error": f"Tool '{tool_name}' not found"}), 404
     
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-            'Connection': 'keep-alive'
-        }
-    )
+    # Appeler la fonction principale
+    return book_appointment()
 
 @app.route("/mcp", methods=["POST"])
 def mcp_execute():
-    """Exécution des commandes MCP"""
+    """Route POST principale pour l'exécution"""
     data = request.json
-    print(f"[MCP] Requête reçue: {json.dumps(data)}")
     
-    # Extraire les paramètres selon le format ElevenLabs
-    if "method" in data and data["method"] == "tools/call":
+    # Gérer différents formats de requête
+    if data.get("method") == "tools/call":
+        # Format MCP standard
         tool_name = data.get("params", {}).get("name", "book_appointment")
         params = data.get("params", {}).get("arguments", {})
+    elif "tool" in data:
+        # Format avec tool spécifié
+        tool_name = data.get("tool")
+        params = data.get("arguments", data.get("params", {}))
     else:
         # Format direct
+        tool_name = "book_appointment"
         params = data
+    
+    if tool_name == "book_appointment":
+        return book_appointment(params)
+    else:
+        return jsonify({"error": f"Unknown tool: {tool_name}"}), 400
+
+def book_appointment(params=None):
+    """Fonction principale de réservation"""
+    if params is None:
+        params = request.json or {}
+    
+    print(f"[BOOKING] Paramètres reçus: {json.dumps(params)}")
     
     name = params.get("name", "Client")
     client_phone = params.get("phone")
@@ -95,10 +111,10 @@ def mcp_execute():
 
     # Validations
     if not start_str:
-        return jsonify({"error": "Date et heure requises"}), 400
+        return jsonify({"error": "Date et heure requises", "success": False}), 400
     
     if not client_phone:
-        return jsonify({"error": "Numéro de téléphone requis"}), 400
+        return jsonify({"error": "Numéro de téléphone requis", "success": False}), 400
     
     # Formater le numéro de téléphone
     client_phone = client_phone.replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
@@ -124,18 +140,34 @@ def mcp_execute():
             start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
             start_time = pytz.timezone(TIMEZONE).localize(start_time)
     except:
-        return jsonify({"error": "Format de date invalide. Utilisez: 2025-06-27T14:00:00"}), 400
+        return jsonify({
+            "error": "Format de date invalide. Utilisez: 2025-06-27T14:00:00",
+            "success": False
+        }), 400
     
     # Vérifier le délai minimum
     now = datetime.now(pytz.timezone(TIMEZONE))
     if start_time < now + timedelta(hours=3):
-        return jsonify({"error": "Les réservations doivent être faites au moins 3 heures à l'avance"}), 400
+        return jsonify({
+            "error": "Les réservations doivent être faites au moins 3 heures à l'avance",
+            "success": False
+        }), 400
 
     # Vérifier les heures d'ouverture (9h à 21h)
     if start_time.hour < 9 or start_time.hour >= 21:
-        return jsonify({"error": "Les rendez-vous sont disponibles de 9h à 21h seulement"}), 400
+        return jsonify({
+            "error": "Les rendez-vous sont disponibles de 9h à 21h seulement",
+            "success": False
+        }), 400
 
     end_time = start_time + timedelta(minutes=30)
+
+    # Vérifier que nous avons un access token
+    if not ACCESS_TOKEN or ACCESS_TOKEN == "PASTE_YOUR_ACCESS_TOKEN_HERE":
+        return jsonify({
+            "error": "Configuration manquante: GOOGLE_ACCESS_TOKEN",
+            "success": False
+        }), 500
 
     # Headers pour Google API
     headers = {
@@ -154,11 +186,18 @@ def mcp_execute():
 
     if busy_check.status_code != 200:
         print(f"Erreur freeBusy: {busy_check.text}")
-        return jsonify({"error": "Erreur lors de la vérification des disponibilités"}), 500
+        return jsonify({
+            "error": "Erreur lors de la vérification des disponibilités",
+            "success": False,
+            "details": busy_check.text
+        }), 500
 
     busy_slots = busy_check.json().get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
     if busy_slots:
-        return jsonify({"error": "Ce créneau est déjà réservé. Veuillez choisir un autre moment."}), 409
+        return jsonify({
+            "error": "Ce créneau est déjà réservé. Veuillez choisir un autre moment.",
+            "success": False
+        }), 409
 
     # Créer l'événement
     event_url = f"https://www.googleapis.com/calendar/v3/calendars/{CALENDAR_ID}/events?conferenceDataVersion=1"
@@ -203,7 +242,11 @@ def mcp_execute():
     
     if created_event.status_code != 200:
         print(f"Erreur création événement: {created_event.text}")
-        return jsonify({"error": "Erreur lors de la création du rendez-vous"}), 500
+        return jsonify({
+            "error": "Erreur lors de la création du rendez-vous",
+            "success": False,
+            "details": created_event.text
+        }), 500
 
     event_data = created_event.json()
     meet_link = "Non disponible"
@@ -216,6 +259,7 @@ def mcp_execute():
                 break
 
     # Envoyer le SMS
+    sms_sent = False
     if TWILIO_SID and TWILIO_TOKEN:
         try:
             twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -248,24 +292,31 @@ def mcp_execute():
         except Exception as e:
             print(f"Erreur Twilio: {e}")
             sms_sent = False
-    else:
-        sms_sent = False
 
     # Réponse de succès
     response = {
         "success": True,
         "message": f"Rendez-vous confirmé pour {name} le {start_time.strftime('%d/%m/%Y à %H:%M')}",
-        "details": {
+        "result": {
             "client_name": name,
             "client_phone": client_phone,
             "start": start_time.isoformat(),
             "end": end_time.isoformat(),
             "meet_link": meet_link,
-            "sms_sent": sms_sent
+            "sms_sent": sms_sent,
+            "calendar_event_id": event_data.get("id")
         }
     }
 
-    return jsonify(response)
+    return jsonify(response), 200
+
+# Routes additionnelles pour différents formats
+@app.route("/mcp/list-tools", methods=["GET"])
+def list_tools():
+    """Liste des outils disponibles"""
+    return jsonify({
+        "tools": ["book_appointment"]
+    })
 
 if __name__ == "__main__":
     # Vérification au démarrage
