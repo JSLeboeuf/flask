@@ -71,13 +71,16 @@ def health():
 def mcp_sse():
     if request.method == "GET":
         def generate():
+            # Events strictement attendus par ElevenLabs :
+            yield f"event: protocol_version\ndata: {json.dumps({'protocol_version': '0.1.0'})}\n\n"
+            yield f"event: capabilities\ndata: {json.dumps({'tools': True})}\n\n"
             yield f"event: message\ndata: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
             tools_data = {
                 "type": "tools",
                 "tools": [{
                     "name": "book_appointment",
                     "description": "Réserver un rendez-vous dans Google Calendar avec envoi SMS",
-                    "inputSchema": {
+                    "input_schema": {  # <-- important : input_schema (pas inputSchema)
                         "type": "object",
                         "properties": {
                             "name": {
