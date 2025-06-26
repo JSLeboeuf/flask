@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, abort
 import requests
 from datetime import datetime, timedelta
 import os
@@ -7,24 +7,27 @@ from twilio.rest import Client
 import json
 import uuid
 import time
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1 Mo max payload
 
-# Configuration
+# Rate limiting: 5 POST/minute/IP sur /mcp
+limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"])
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 CALENDAR_ID = os.environ.get("CALENDAR_ID")
 TIMEZONE = "America/Toronto"
-
 TWILIO_SID = os.environ.get("TWILIO_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_FROM")
 SMS_RECIPIENT = os.environ.get("SMS_RECIPIENT")
 EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT")
-
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
-
+MCP_SECRET_TOKEN = os.environ.get("MCP_SECRET_TOKEN")
 ACCESS_TOKEN = None
 
 def get_access_token():
@@ -52,7 +55,6 @@ def get_access_token():
         print(f"❌ Erreur lors du refresh: {response.text}")
         return None
 
-# Initialisation globale
 print("🚀 Chargement du serveur MCP SSE Autoscale Calendar")
 print(f"📅 Calendrier: {CALENDAR_ID}")
 print(f"📱 SMS depuis: {TWILIO_FROM}")
@@ -68,10 +70,17 @@ def health():
     return jsonify({"status": "ok", "service": "Autoscale Calendar MCP"})
 
 @app.route("/mcp", methods=["GET", "POST"])
+@limiter.limit("5 per minute", methods=["POST"])
 def mcp_sse():
+    # --- Sécurité : vérif secret sur POST
+    if request.method == "POST":
+        if MCP_SECRET_TOKEN:
+            auth = request.headers.get("Authorization", "")
+            if not auth or f"Bearer {MCP_SECRET_TOKEN}" not in auth:
+                print("Tentative POST sans Authorization correcte : headers=", dict(request.headers))
+                abort(401, "Unauthorized")
     if request.method == "GET":
         def generate():
-            # Events strictement attendus par ElevenLabs :
             yield f"event: protocol_version\ndata: {json.dumps({'protocol_version': '0.1.0'})}\n\n"
             yield f"event: capabilities\ndata: {json.dumps({'tools': True})}\n\n"
             yield f"event: message\ndata: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
@@ -80,21 +89,12 @@ def mcp_sse():
                 "tools": [{
                     "name": "book_appointment",
                     "description": "Réserver un rendez-vous dans Google Calendar avec envoi SMS",
-                    "inputSchema": {  # <-- camelCase ici !
+                    "inputSchema": {  # <-- camelCase pour ElevenLabs
                         "type": "object",
                         "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Nom complet du client"
-                            },
-                            "phone": {
-                                "type": "string",
-                                "description": "Numéro de téléphone (ex: 514-123-4567)"
-                            },
-                            "start": {
-                                "type": "string",
-                                "description": "Date et heure (format: 2025-06-27T14:00:00)"
-                            }
+                            "name": {"type": "string", "description": "Nom complet du client"},
+                            "phone": {"type": "string", "description": "Numéro de téléphone (ex: 514-123-4567)"},
+                            "start": {"type": "string", "description": "Date et heure (format: 2025-06-27T14:00:00)"}
                         },
                         "required": ["name", "phone", "start"]
                     }
@@ -115,8 +115,9 @@ def mcp_sse():
     elif request.method == "POST":
         try:
             data = request.get_json(force=True)
-        except:
-            data = {}
+        except Exception as e:
+            print("Erreur parsing JSON POST:", e)
+            return jsonify({"success": False, "message": "JSON invalide"}), 400
         print(f"[MCP POST] Données reçues: {json.dumps(data)}")
         method = data.get("method", "")
         if method == "tools/call":
@@ -295,7 +296,6 @@ def book_appointment_logic(params):
         "message": f"✅ Rendez-vous confirmé pour {name} le {start_time.strftime('%d/%m/%Y à %H:%M')}. Un SMS de confirmation avec le lien Google Meet a été envoyé au {client_phone}."
     }
 
-# Route OPTIONS pour CORS
 @app.route("/mcp", methods=["OPTIONS"])
 def mcp_options():
     response = jsonify({})
