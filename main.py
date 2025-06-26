@@ -80,7 +80,7 @@ def mcp_sse():
                 "tools": [{
                     "name": "book_appointment",
                     "description": "Réserver un rendez-vous dans Google Calendar avec envoi SMS",
-                    "input_schema": {  # <-- important : input_schema (pas inputSchema)
+                    "inputSchema": {  # <-- camelCase ici !
                         "type": "object",
                         "properties": {
                             "name": {
